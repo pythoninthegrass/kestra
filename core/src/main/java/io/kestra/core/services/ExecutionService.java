@@ -459,19 +459,16 @@ public class ExecutionService {
      * @param flow      the flow of the execution
      * @param inputs    the onResume inputs
      * @return the execution in the new state.
-     * @throws Exception if the state of the execution cannot be updated
      */
     public Mono<List<InputAndValue>> validateForResume(final Execution execution, Flow flow, @Nullable Publisher<CompletedPart> inputs) {
-        return getFirstPausedTaskOrThrow(execution, flow).handle((task, sink) -> {
-            if (task instanceof Pause pauseTask) {
-                flowInputOutput.validateExecutionInputs(
-                    pauseTask.getOnResume(),
-                    execution,
-                    inputs
-                ).subscribe(sink::next, sink::error);
-            }
-            sink.next(Collections.emptyList());
-        });
+        return getFirstPausedTaskOr(execution, flow)
+            .flatMap(task -> {
+                if (task.isPresent() && task.get() instanceof Pause pauseTask) {
+                    return flowInputOutput.validateExecutionInputs(pauseTask.getOnResume(), execution, inputs);
+                } else {
+                    return Mono.just(Collections.emptyList());
+                }
+            });
     }
 
     /**
@@ -483,35 +480,32 @@ public class ExecutionService {
      * @param flow      the flow of the execution
      * @param inputs    the onResume inputs
      * @return the execution in the new state.
-     * @throws Exception if the state of the execution cannot be updated
      */
     public Mono<Execution> resume(final Execution execution, Flow flow, State.Type newState, @Nullable Publisher<CompletedPart> inputs) {
-        return getFirstPausedTaskOrThrow(execution, flow).handle((task, sink) -> {
-            Mono<Map<String, Object>> monoOutputs;
-
-            if (task instanceof Pause pauseTask) {
-                monoOutputs = flowInputOutput.readExecutionInputs(pauseTask.getOnResume(), execution, inputs);
-            } else {
-                monoOutputs = Mono.just(Collections.emptyMap());
-            }
-            Mono<Execution> monoExecution = monoOutputs.handle((outputs, monoSink) -> {
+        return getFirstPausedTaskOr(execution, flow)
+            .flatMap(task -> {
+                if (task.isPresent() && task.get() instanceof Pause pauseTask) {
+                    return flowInputOutput.readExecutionInputs(pauseTask.getOnResume(), execution, inputs);
+                } else {
+                    return Mono.just(Collections.<String, Object>emptyMap());
+                }
+            })
+            .handle((resumeInputs, sink) -> {
                 try {
-                    sink.next(resume(execution, flow, newState, outputs));
+                    sink.next(resume(execution, flow, newState, resumeInputs));
                 } catch (Exception e) {
                     sink.error(e);
                 }
             });
-            monoExecution.subscribe(sink::next, sink::error);
-        });
     }
 
-    private static Mono<Task> getFirstPausedTaskOrThrow(Execution execution, Flow flow){
+    private static Mono<Optional<Task>> getFirstPausedTaskOr(Execution execution, Flow flow){
         return Mono.create(sink -> {
             try {
                 var runningTaskRun = execution
                     .findFirstByState(State.Type.PAUSED)
-                    .orElseThrow(() -> new IllegalArgumentException("No paused task found on execution " + execution.getId()));
-                sink.success(flow.findTaskByTaskId(runningTaskRun.getTaskId()));
+                    .map(throwFunction(task -> flow.findTaskByTaskId(task.getTaskId())));
+                sink.success(runningTaskRun);
             } catch (InternalException e) {
                 sink.error(e);
             }
@@ -520,7 +514,7 @@ public class ExecutionService {
 
     /**
      * Resume a paused execution to a new state.
-     * The execution must be paused or this call will be a no-op.
+     * The execution must be paused or this call will throw an IllegalArgumentException.
      *
      * @param execution the execution to resume
      * @param newState  should be RUNNING or KILLING, other states may lead to undefined behavior
@@ -530,14 +524,41 @@ public class ExecutionService {
      * @throws Exception if the state of the execution cannot be updated
      */
     public Execution resume(final Execution execution, Flow flow, State.Type newState, @Nullable Map<String, Object> inputs) throws Exception {
-        var runningTaskRun = execution
-            .findFirstByState(State.Type.PAUSED)
-            .orElseThrow(() -> new IllegalArgumentException("No paused task found on execution " + execution.getId()));
+        var pausedTaskRun = execution
+            .findFirstByState(State.Type.PAUSED);
 
-        var unpausedExecution = this.markAs(execution, flow, runningTaskRun.getId(), newState, inputs);
+        Execution unpausedExecution;
+        if (pausedTaskRun.isPresent()) {
+            unpausedExecution = this.markAs(execution, flow, pausedTaskRun.get().getId(), newState, inputs);
+        } else {
+            // we are in a manual execution pause, not triggered by the Pause task, so we just switch the execution to the new state.
+            if (!execution.getState().isPaused()) {
+                throw new IllegalArgumentException("The execution is not paused");
+            }
+            unpausedExecution = execution.withState(newState);
+        }
 
         this.eventPublisher.publishEvent(new CrudEvent<>(unpausedExecution, execution, CrudEventType.UPDATE));
         return unpausedExecution;
+    }
+
+    /**
+     * Pause a running execution.
+     * The execution must be running or this call will throw an IllegalArgumentException.
+     *
+     * @param execution the execution to resume
+     * @return the execution in the new state.
+     * @throws Exception if the state of the execution cannot be updated
+     */
+    public Execution pause(final Execution execution) throws Exception {
+        if (!execution.getState().isRunning()) {
+            throw new IllegalArgumentException("The execution is not running");
+        }
+
+        var pausedExecution = execution.withState(State.Type.PAUSED);
+
+        this.eventPublisher.publishEvent(new CrudEvent<>(pausedExecution, execution, CrudEventType.UPDATE));
+        return pausedExecution;
     }
 
     /**
